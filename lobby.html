@@ -46,7 +46,7 @@
   </div>
 
   <script type="module">
-    // ✅ Alias the import to avoid colliding with our own joinRoom() function
+    // ✅ Correct scoped package + aliased to avoid colliding with our own joinRoom()
     import { joinRoom as trysteroJoin } from 'https://esm.run/@trystero-p2p/mqtt';
 
     // -- Configuration -------------------------------------------------
@@ -118,13 +118,30 @@
       }
     }
 
+    // -- Normalise makeAction: works with both [send, receive] arrays --
+    // -- and newer {send, onMessage} object shapes                    --
+    function actionPair(name) {
+      const result = room.makeAction(name);
+      if (Array.isArray(result)) {
+        return [result[0], result[1]];
+      }
+      if (result && typeof result === 'object') {
+        const send = result.send?.bind(result);
+        const receive = result.onMessage
+          ? result.onMessage.bind(result)
+          : result.receive?.bind(result);
+        if (send && receive) return [send, receive];
+      }
+      throw new Error(`Unsupported makeAction("${name}") shape`);
+    }
+
     // -- Shared room handlers (host + client) --------------------------
     function setupRoomHandlers() {
-      const [, onProbe]        = room.makeAction('probe');
-      const [sendProbeReply]   = room.makeAction('probe-reply');
-      const [sendJoin, onJoin] = room.makeAction('join');
-      const [sendWelcome, onWelcome] = room.makeAction('welcome');
-      const [sendStart, onStart]     = room.makeAction('start');
+      const [, onProbe]              = actionPair('probe');
+      const [sendProbeReply]         = actionPair('probe-reply');
+      const [sendJoin, onJoin]       = actionPair('join');
+      const [sendWelcome, onWelcome] = actionPair('welcome');
+      const [sendStart, onStart]     = actionPair('start');
 
       sendJoinFn = sendJoin;
       sendStartFn = sendStart;
@@ -202,7 +219,6 @@
       const resultsEl = document.getElementById('search-results');
       resultsEl.innerHTML = `<p>Probing ${ROOM_CODES.length} room slots…</p>`;
 
-      // Probe in batches of 4 to avoid hammering the MQTT broker
       const results = [];
       const BATCH = 4;
       for (let i = 0; i < ROOM_CODES.length; i += BATCH) {
@@ -244,7 +260,6 @@
         };
         const timer = setTimeout(() => finish(null), 3000);
 
-        // Let peer discovery settle, then check who's in the room
         setTimeout(() => {
           const peers = Object.keys(tempRoom.getPeers());
           clearTimeout(timer);
@@ -311,7 +326,6 @@
         return;
       }
       if (sendStartFn) sendStartFn();  // broadcast to all peers
-      // Small delay so the message actually goes out before we navigate
       setTimeout(() => {
         window.location.href =
           `index.html?room=${encodeURIComponent(roomCode)}&role=host`;

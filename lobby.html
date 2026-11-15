@@ -45,7 +45,6 @@
     <p id="room-status"></p>
   </div>
 
-  <!-- upeerjs is an ES module: it MUST be imported, not loaded as a plain script -->
   <script type="module">
     import { Peer } from 'https://cdn.jsdelivr.net/npm/upeerjs@0.0.3/+esm';
 
@@ -53,8 +52,20 @@
     const PREFIX = "p2p-pong-";
     const ROOM_CODES = [];
     for (let i = 1; i <= 12; i++) ROOM_CODES.push("PONG-" + String(i).padStart(2, "0"));
-    const MQTT_BROKER = "wss://broker.emqx.io:8084/mqtt"; // free public broker
-    const SECURITY_KEY = "e9f2b9e17680713413ba3d21cbe9e9ba";       // E2E encryption for signaling
+
+    // Exactly 32 characters — AES-256 requirement
+    const SECURITY_KEY = "e9f2b9e17680713413ba3d21cbe9e9ba";
+
+    // 🔑 Single options object used by EVERY new Peer() call.
+    // Both brokerUrl and mqttOptions.protocol are forced to wss://
+    // to prevent Mixed Content errors on HTTPS pages.
+    const peerOptions = {
+      brokerUrl: 'wss://broker.emqx.io:8084/mqtt',
+      securityKey: SECURITY_KEY,
+      mqttOptions: {
+        protocol: 'wss'
+      }
+    };
 
     // -- State ----------------------------------------------------------
     let peer = null;
@@ -86,13 +97,11 @@
       }
       const code = ROOM_CODES[idx];
 
-      const p = new Peer(PREFIX + code, {
-        brokerUrl: MQTT_BROKER,
-        securityKey: SECURITY_KEY,
-      });
+      // ✅ peerOptions passed explicitly
+      const p = new Peer(PREFIX + code, peerOptions);
 
       try {
-        await p.start();                 // opens MQTT + registers ID
+        await p.start();
         peer = p;
         roomCode = code;
         attachHostHandlers();
@@ -190,10 +199,8 @@
 
     function probeRoom(code) {
       return new Promise(resolve => {
-        const temp = new Peer(undefined, {
-          brokerUrl: MQTT_BROKER,
-          securityKey: SECURITY_KEY,
-        });
+        // ✅ peerOptions passed explicitly
+        const temp = new Peer(undefined, peerOptions);
         let done = false;
         const finish = result => {
           if (done) return;
@@ -229,10 +236,8 @@
       isHost = false;
       roomCode = code;
 
-      peer = new Peer(undefined, {
-        brokerUrl: MQTT_BROKER,
-        securityKey: SECURITY_KEY,
-      });
+      // ✅ peerOptions passed explicitly
+      peer = new Peer(undefined, peerOptions);
 
       peer.start().then(() => {
         const session = peer.connect(PREFIX + code);

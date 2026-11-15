@@ -2,192 +2,207 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>P2P Pong</title>
+  <title>P2P Pong Lobby</title>
+  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
   <style>
-    body {
-      margin: 0; min-height: 100vh;
-      background: #0a0a0a; color: #eee;
-      display: flex; flex-direction: column;
-      align-items: center; justify-content: center;
-      font-family: system-ui, monospace;
-    }
-    #info {
-      max-width: 600px; margin: 16px; padding: 14px;
-      background: #1a1a1a; border-radius: 8px;
-      font-size: 13px; line-height: 1.6;
-    }
-    #info strong { color: #ff5555; }
+    body { font-family: system-ui, sans-serif; max-width: 500px; margin: 40px auto; padding: 20px; }
+    button { padding: 10px 20px; margin: 5px; font-size: 16px; cursor: pointer; }
+    #lobby-view, #room-view { display: none; margin-top: 20px; }
+    .player-item { padding: 8px; background: #f0f0f0; margin: 4px 0; border-radius: 4px; }
+    #room-code-display { font-size: 24px; font-weight: bold; letter-spacing: 2px; color: #0066cc; }
+    #status-message { color: #555; margin-top: 10px; }
   </style>
 </head>
 <body>
-  <div id="info">
-    <strong>P2P Pong</strong> — Open this page in two tabs, join the same room, and play.<br>
-    <em>Local note:</em> both tabs share one keyboard, so both paddles react to the same arrows.
-    For real play, share the URL with a friend on another device.
+  <h1>🎮 P2P Pong Lobby</h1>
+
+  <!-- Initial view: create or join -->
+  <div id="lobby-view" style="display:block;">
+    <button onclick="createRoom()">Create Room (Host)</button>
+    <button onclick="showJoinPrompt()">Join Room (Client)</button>
+    <p id="status-message"></p>
   </div>
 
-  <script src="https://unpkg.com/netplayjs"></script>
+  <!-- Room view: share code, see players -->
+  <div id="room-view">
+    <p>Room Code: <span id="room-code-display"></span></p>
+    <p>Share this code with friends. They select "Join Room" and enter it.</p>
+    <h3>Players in Room:</h3>
+    <ul id="player-list"></ul>
+    <button id="start-game-btn" onclick="startGame()" style="display:none;">Start Game</button>
+    <p id="room-status"></p>
+  </div>
+
   <script>
-    class PongGame extends netplayjs.Game {
-      // --- NetplayJS requires these static properties ---
-      static timestep = 1000 / 60;
-      static canvasSize = { width: 800, height: 500 };
+    const PREFIX = "p2p-pong-"; // Unique prefix to avoid collisions on the public server
+    let peer = null;
+    let isHost = false;
+    let roomCode = "";
+    let connections = []; // Host: all client connections. Client: single connection to host.
+    let myName = "Player";
 
-      constructor() {
-        super();
-        this.width = 800;
-        this.height = 500;
-        this.paddleW = 12;
-        this.paddleH = 80;
-        this.paddleSpeed = 6;
-        this.reset();
+    // --- UTILITIES ---
+
+    function generateRoomCode() {
+      // Avoid ambiguous characters (no O/0, I/1) for easy sharing[reference:4]
+      const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+      let code = "";
+      for (let i = 0; i < 5; i++) {
+        code += chars.charAt(Math.floor(Math.random() * chars.length));
       }
-
-      reset() {
-        this.ball  = { x: 400, y: 250, vx: 4, vy: 3, r: 8 };
-        this.p0Y   = 250;
-        this.p1Y   = 250;
-        this.score0 = 0;
-        this.score1 = 0;
-        this.paused = true;
-      }
-
-      // ---- GAME LOOP (runs at 60 Hz, syncs across peers) ----
-      tick(playerInputs) {
-        // Pause until both players are connected
-        if (playerInputs.size < 2) { this.paused = true; return; }
-        this.paused = false;
-
-        // 1. Read inputs and move paddles
-        for (const [player, input] of playerInputs.entries()) {
-          const v = input.arrowKeys();
-          if (player.getID() === 0) {
-            this.p0Y -= v.y * this.paddleSpeed;
-            this.p0Y = Math.max(this.paddleH / 2,
-              Math.min(this.height - this.paddleH / 2, this.p0Y));
-          } else if (player.getID() === 1) {
-            this.p1Y -= v.y * this.paddleSpeed;
-            this.p1Y = Math.max(this.paddleH / 2,
-              Math.min(this.height - this.paddleH / 2, this.p1Y));
-          }
-        }
-
-        // 2. Move ball
-        this.ball.x += this.ball.vx;
-        this.ball.y += this.ball.vy;
-
-        // 3. Bounce off top/bottom walls
-        if (this.ball.y - this.ball.r < 0) {
-          this.ball.y = this.ball.r; this.ball.vy *= -1;
-        }
-        if (this.ball.y + this.ball.r > this.height) {
-          this.ball.y = this.height - this.ball.r; this.ball.vy *= -1;
-        }
-
-        // 4. Paddle collisions
-        this.collide(0);
-        this.collide(1);
-
-        // 5. Scoring (deterministic — no Math.random!)
-        if (this.ball.x + this.ball.r < 0) {
-          this.score1++; this.serve(-1);
-        } else if (this.ball.x - this.ball.r > this.width) {
-          this.score0++; this.serve(1);
-        }
-      }
-
-      collide(idx) {
-        const px = idx === 0 ? 20 : this.width - 20 - this.paddleW;
-        const py = (idx === 0 ? this.p0Y : this.p1Y) - this.paddleH / 2;
-        const b = this.ball;
-
-        const overlaps =
-          b.x + b.r > px && b.x - b.r < px + this.paddleW &&
-          b.y + b.r > py && b.y - b.r < py + this.paddleH;
-        if (!overlaps) return;
-
-        // Only bounce if the ball is on the correct side and moving toward the paddle
-        if (idx === 0 && b.vx < 0 && b.x > px + this.paddleW / 2) {
-          b.vx = Math.abs(b.vx);
-          b.x = px + this.paddleW + b.r;
-        } else if (idx === 1 && b.vx > 0 && b.x < px + this.paddleW / 2) {
-          b.vx = -Math.abs(b.vx);
-          b.x = px - b.r;
-        }
-      }
-
-      serve(dir) {
-        this.ball.x = this.width / 2;
-        this.ball.y = this.height / 2;
-        this.ball.vx = 4 * dir;
-        // Deterministic alternate: no randomness, so both peers agree
-        this.ball.vy = (this.score0 + this.score1) % 2 === 0 ? 3 : -3;
-      }
-
-      // ---- RENDERING ----
-      draw(canvas) {
-        const ctx = canvas.getContext('2d');
-
-        ctx.fillStyle = '#0a0a0a';
-        ctx.fillRect(0, 0, this.width, this.height);
-
-        // Center dashed line
-        ctx.strokeStyle = '#333';
-        ctx.setLineDash([8, 12]);
-        ctx.beginPath();
-        ctx.moveTo(this.width / 2, 0);
-        ctx.lineTo(this.width / 2, this.height);
-        ctx.stroke();
-        ctx.setLineDash([]);
-
-        // Paddles
-        ctx.fillStyle = '#ff5555';
-        ctx.fillRect(20, this.p0Y - this.paddleH / 2, this.paddleW, this.paddleH);
-        ctx.fillStyle = '#5599ff';
-        ctx.fillRect(this.width - 20 - this.paddleW,
-                     this.p1Y - this.paddleH / 2, this.paddleW, this.paddleH);
-
-        // Ball with glow
-        ctx.fillStyle = '#fff';
-        ctx.shadowColor = '#fff';
-        ctx.shadowBlur = 12;
-        ctx.beginPath();
-        ctx.arc(this.ball.x, this.ball.y, this.ball.r, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.shadowBlur = 0;
-
-        // Scores
-        ctx.font = 'bold 48px monospace';
-        ctx.textAlign = 'center';
-        ctx.fillStyle = '#ff5555';
-        ctx.fillText(this.score0, this.width / 4, 64);
-        ctx.fillStyle = '#5599ff';
-        ctx.fillText(this.score1, (3 * this.width) / 4, 64);
-
-        // Paddle labels
-        ctx.font = '14px monospace';
-        ctx.fillStyle = '#ff5555';
-        ctx.fillText('P1', 26, this.height - 12);
-        ctx.fillStyle = '#5599ff';
-        ctx.fillText('P2', this.width - 26, this.height - 12);
-
-        // Waiting overlay
-        if (this.paused) {
-          ctx.fillStyle = 'rgba(0,0,0,0.72)';
-          ctx.fillRect(0, 0, this.width, this.height);
-          ctx.fillStyle = '#fff';
-          ctx.font = '24px monospace';
-          ctx.fillText('Waiting for opponent…', this.width / 2, this.height / 2);
-          ctx.fillStyle = '#aaa';
-          ctx.font = '14px monospace';
-          ctx.fillText('Share this URL with a friend',
-                       this.width / 2, this.height / 2 + 40);
-        }
-      }
+      return code;
     }
 
-    // Handles matchmaking UI, WebRTC signaling, rollback sync, input capture.
-    new netplayjs.RollbackWrapper(PongGame).start();
+    function showRoomView(code) {
+      document.getElementById('lobby-view').style.display = 'none';
+      document.getElementById('room-view').style.display = 'block';
+      document.getElementById('room-code-display').innerText = code;
+    }
+
+    function updatePlayerList(names) {
+      const list = document.getElementById('player-list');
+      list.innerHTML = '';
+      names.forEach(name => {
+        const li = document.createElement('li');
+        li.className = 'player-item';
+        li.innerText = name;
+        list.appendChild(li);
+      });
+    }
+
+    // --- HOST LOGIC ---
+
+    function createRoom() {
+      isHost = true;
+      roomCode = generateRoomCode();
+      const fullPeerId = PREFIX + roomCode;
+
+      peer = new Peer(fullPeerId);
+
+      peer.on('open', (id) => {
+        document.getElementById('status-message').innerText = "Room created!";
+        showRoomView(roomCode);
+        document.getElementById('start-game-btn').style.display = 'block';
+        document.getElementById('room-status').innerText = "Waiting for players to join...";
+        updatePlayerList(["Host (You)"]);
+      });
+
+      peer.on('error', (err) => {
+        document.getElementById('status-message').innerText = "Error: " + err.type;
+      });
+
+      // A new client is trying to connect
+      peer.on('connection', (conn) => {
+        connections.push(conn);
+        const playerName = `Player ${connections.length + 1}`;
+
+        conn.on('open', () => {
+          // Tell the new client their assigned name
+          conn.send({ type: 'welcome', name: playerName });
+          // Tell everyone else about the new player
+          broadcast({ type: 'player-joined', name: playerName });
+          refreshHostPlayerList();
+          document.getElementById('room-status').innerText =
+            `${connections.length} player(s) connected.`;
+        });
+
+        conn.on('data', (data) => {
+          // Clients might send a ready signal or their own name
+          if (data.type === 'join') {
+            conn.send({ type: 'welcome', name: playerName });
+          }
+        });
+
+        conn.on('close', () => {
+          connections = connections.filter(c => c !== conn);
+          broadcast({ type: 'player-left', name: playerName });
+          refreshHostPlayerList();
+          document.getElementById('room-status').innerText =
+            `${connections.length} player(s) connected.`;
+        });
+      });
+    }
+
+    function refreshHostPlayerList() {
+      const names = ["Host (You)", ...connections.map((_, i) => `Player ${i + 2}`)];
+      updatePlayerList(names);
+    }
+
+    function broadcast(message) {
+      connections.forEach(conn => {
+        if (conn.open) conn.send(message);
+      });
+    }
+
+    // --- CLIENT LOGIC ---
+
+    function showJoinPrompt() {
+      const code = prompt("Enter the 5-character Room Code:");
+      if (!code) return;
+      joinRoom(code.trim().toUpperCase());
+    }
+
+    function joinRoom(code) {
+      isHost = false;
+      roomCode = code;
+      const fullPeerId = PREFIX + roomCode;
+
+      peer = new Peer(); // Random ID for the client
+
+      peer.on('open', () => {
+        const conn = peer.connect(fullPeerId);
+        connections.push(conn); // Client keeps only this one connection
+
+        conn.on('open', () => {
+          document.getElementById('status-message').innerText = "Connected!";
+          showRoomView(code);
+          conn.send({ type: 'join' });
+        });
+
+        conn.on('data', (data) => {
+          if (data.type === 'welcome') {
+            myName = data.name;
+            updatePlayerList([myName]);
+          }
+          if (data.type === 'player-joined') {
+            // Client receives the new player's name and adds it
+            const list = document.getElementById('player-list');
+            const li = document.createElement('li');
+            li.className = 'player-item';
+            li.innerText = data.name;
+            list.appendChild(li);
+          }
+          if (data.type === 'player-left') {
+            // Remove the player from the list (simplified)
+            const items = document.querySelectorAll('.player-item');
+            items.forEach(item => {
+              if (item.innerText === data.name) item.remove();
+            });
+          }
+          if (data.type === 'start-game') {
+            // This is where the handoff to the game happens
+            window.location.href = `index.html?room=${roomCode}&role=client&name=${encodeURIComponent(myName)}`;
+          }
+        });
+
+        conn.on('error', (err) => {
+          document.getElementById('status-message').innerText = "Connection error: " + err;
+        });
+      });
+    }
+
+    // --- START GAME ---
+
+    function startGame() {
+      if (!isHost || connections.length === 0) {
+        alert("Wait for at least one player to join.");
+        return;
+      }
+      // Tell all clients to go to the game page
+      broadcast({ type: 'start-game' });
+      // Host also goes to the game page
+      window.location.href = `index.html?room=${roomCode}&role=host`;
+    }
   </script>
 </body>
 </html>

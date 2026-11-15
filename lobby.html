@@ -53,9 +53,8 @@
     const PREFIX = "p2p-pong-";
     const ROOM_CODES = [];
     for (let i = 1; i <= 12; i++) ROOM_CODES.push("PONG-" + String(i).padStart(2, "0"));
-
     const MQTT_BROKER = "wss://broker.emqx.io:8084/mqtt"; // free public broker
-    const SECURITY_KEY = "e9f2b9e17680713413ba3d21cbe9e9ba005dc776de3153c3d772dfcd161fbf95";       // E2E encryption for signaling
+    const SECURITY_KEY = "e9f2b9e17680713413ba3d21cbe9e9ba";       // E2E encryption for signaling
 
     // -- State ----------------------------------------------------------
     let peer = null;

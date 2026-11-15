@@ -59,6 +59,7 @@
     const JOIN_RETRY_MS           = 1500;
     const JOIN_TIMEOUT_MS         = 15000;
     const MAX_PLAYERS             = 2;
+    const HOST_LEAVE_GRACE_MS     = 2000;
 
     let room = null;
     let isHost = false;
@@ -70,6 +71,10 @@
     let joinTimeout = null;
     let joinRetry = null;
     let busy = false;
+
+    // --- Client-side "leave and go to game" state ---
+    let navigatedAway = false;
+    let leaveTimer = null;
 
     function showView(id) {
       ['lobby-view', 'search-view', 'room-view'].forEach(v => {
@@ -87,6 +92,15 @@
       } else {
         el.innerText = `Players: ${total}/${MAX_PLAYERS} — ready! Click Start Game.`;
       }
+    }
+
+    function goToGame() {
+      if (navigatedAway) return;
+      navigatedAway = true;
+      if (leaveTimer) { clearTimeout(leaveTimer); leaveTimer = null; }
+      console.log('[lobby] navigating client to game');
+      window.location.href =
+        `index.html?room=${encodeURIComponent(roomCode)}&role=client`;
     }
 
     function createRoom() {
@@ -203,11 +217,9 @@
       });
 
       onStart(() => {
-        if (!isHost) {
-          console.log('[lobby] start received — navigating to game');
-          window.location.href =
-            `index.html?room=${encodeURIComponent(roomCode)}&role=client`;
-        }
+        if (isHost) return;
+        console.log('[lobby] received start — going to game');
+        goToGame();
       });
 
       room.onPeerLeave(peerId => {
@@ -216,7 +228,29 @@
           refreshHostPlayerList();
           updateRoomStatus();
         } else {
-          document.getElementById('room-status').innerText = "Host disconnected.";
+          // Client: host vanished. Could be the game starting OR a crash.
+          // Wait 2s — if the host comes back, treat it as a blip.
+          document.getElementById('room-status').innerText =
+            "Host left — following to game…";
+          leaveTimer = setTimeout(() => {
+            leaveTimer = null;
+            if (navigatedAway) return;
+            if (Object.keys(room.getPeers()).length === 0) {
+              console.log('[lobby] host did not return — assuming game start');
+              goToGame();
+            }
+          }, HOST_LEAVE_GRACE_MS);
+        }
+      });
+
+      room.onPeerJoin(peerId => {
+        if (leaveTimer) {
+          clearTimeout(leaveTimer);
+          leaveTimer = null;
+          if (!isHost) {
+            document.getElementById('room-status').innerText =
+              "Host reconnected — waiting for start.";
+          }
         }
       });
     }
@@ -368,6 +402,9 @@
         alert("Wait for at least one player to join.");
         return;
       }
+      // Fire start repeatedly, then navigate. The client also has a
+      // "host left" fallback, so even if all these messages are lost
+      // the client will follow us to the game page within ~2s.
       let sent = 0;
       const sendInterval = setInterval(() => {
         if (sendStartFn) sendStartFn();

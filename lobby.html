@@ -3,8 +3,6 @@
 <head>
   <meta charset="utf-8">
   <title>P2P Pong Lobby</title>
-  <!-- upeerjs: serverless P2P over MQTT -->
-  <script src="https://unpkg.com/upeerjs@0.0.3/dist/upeer.min.js"></script>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 620px; margin: 40px auto; padding: 20px; }
     button { padding: 10px 18px; margin: 5px 5px 5px 0; font-size: 15px; cursor: pointer;
@@ -47,7 +45,10 @@
     <p id="room-status"></p>
   </div>
 
-  <script>
+  <!-- upeerjs is an ES module: it MUST be imported, not loaded as a plain script -->
+  <script type="module">
+    import { Peer } from 'https://cdn.jsdelivr.net/npm/upeerjs@0.0.3/+esm';
+
     // -- Configuration -------------------------------------------------
     const PREFIX = "p2p-pong-";
     const ROOM_CODES = [];
@@ -60,7 +61,7 @@
     let peer = null;
     let isHost = false;
     let roomCode = "";
-    let connections = [];       // host: client sessions; client: one session
+    let connections = [];
     let myName = "Player";
 
     // -- UI helpers -----------------------------------------------------
@@ -86,7 +87,6 @@
       }
       const code = ROOM_CODES[idx];
 
-      // upeerjs Peer: same API shape as PeerJS, but MQTT signaling
       const p = new Peer(PREFIX + code, {
         brokerUrl: MQTT_BROKER,
         securityKey: SECURITY_KEY,
@@ -104,7 +104,6 @@
         updatePlayerList(["Host (You)"]);
         showView('room-view');
       } catch (err) {
-        // If the ID is taken, move to the next slot
         if (err && (err.type === 'unavailable-id' || String(err).includes('unavailable'))) {
           tryNextCode(idx + 1);
         } else {
@@ -119,14 +118,12 @@
       peer.on('dataConnection', ({ peerId, conn }) => {
         let registered = false;
 
-        // Handle discovery probe first
         conn.on('data', data => {
           if (data && data.type === 'probe') {
             conn.send({
               type: 'probe-reply',
               info: { playerCount: connections.length + 1, maxPlayers: 2 }
             });
-            // Close the probe session shortly after replying
             setTimeout(() => { try { conn.close(); } catch(e) {} }, 150);
             return;
           }
@@ -194,7 +191,7 @@
 
     function probeRoom(code) {
       return new Promise(resolve => {
-        const temp = new Peer(undefined, { // random temporary ID
+        const temp = new Peer(undefined, {
           brokerUrl: MQTT_BROKER,
           securityKey: SECURITY_KEY,
         });
@@ -209,7 +206,6 @@
 
         temp.start().then(() => {
           const session = temp.connect(PREFIX + code);
-          // Listen for data on the outgoing session
           temp.on('dataConnection', ({ conn }) => {
             conn.on('data', data => {
               if (data && data.type === 'probe-reply') {
@@ -219,7 +215,6 @@
             });
             conn.send({ type: 'probe' });
           });
-          // If the session errors, mark as unavailable
           session.on?.('error', () => { clearTimeout(timer); finish(null); });
         }).catch(() => { clearTimeout(timer); finish(null); });
       });
@@ -235,7 +230,7 @@
       isHost = false;
       roomCode = code;
 
-      peer = new Peer(undefined, { // random client ID
+      peer = new Peer(undefined, {
         brokerUrl: MQTT_BROKER,
         securityKey: SECURITY_KEY,
       });
@@ -245,7 +240,6 @@
         let joined = false;
 
         peer.on('dataConnection', ({ conn }) => {
-          // If this is the session we just opened, attach handlers
           conn.on('open', () => conn.send({ type: 'join' }));
           conn.on('data', data => {
             if (data.type === 'welcome') {
@@ -316,7 +310,14 @@
       broadcast({ type: 'start-game' });
       window.location.href = `index.html?room=${encodeURIComponent(roomCode)}&role=host`;
     }
+
+    // -- Expose functions for HTML onclick handlers ---------------------
+    window.createRoom = createRoom;
+    window.searchRooms = searchRooms;
+    window.showJoinPrompt = showJoinPrompt;
+    window.joinRoom = joinRoom;
+    window.startGame = startGame;
+    window.backToLobby = backToLobby;
   </script>
 </body>
 </html>
-

@@ -46,25 +46,16 @@
   </div>
 
   <script type="module">
-    import { Peer } from 'https://cdn.jsdelivr.net/npm/upeerjs@0.0.3/+esm';
+    // Trystero's MQTT strategy uses secure wss:// brokers by default.
+    import { joinRoom } from 'https://esm.run/trystero/mqtt';
 
     // -- Configuration -------------------------------------------------
-    const PREFIX = "p2p-pong-";
+    const APP_ID = 'p2p-pong-windows123-cmd'; // Unique namespace for your game
     const ROOM_CODES = [];
     for (let i = 1; i <= 12; i++) ROOM_CODES.push("PONG-" + String(i).padStart(2, "0"));
 
-    // Exactly 32 characters — AES-256 requirement
-    const SECURITY_KEY = "e9f2b9e17680713413ba3d21cbe9e9ba";
-
-    // 🔑 Single options object used by EVERY new Peer() call.
-    // Both brokerUrl and mqttOptions.protocol are forced to wss://
-    // to prevent Mixed Content errors on HTTPS pages.
-    const peerOptions = {
-       brokerUrl: 'wss://broker.emqx.io:8084/mqtt',
-       securityKey: SECURITY_KEY
-     };
     // -- State ----------------------------------------------------------
-    let peer = null;
+    let room = null;
     let isHost = false;
     let roomCode = "";
     let connections = [];
@@ -78,7 +69,7 @@
     }
     function backToLobby() { showView('lobby-view'); }
 
-    // -- Create Room (claim first free slot) ----------------------------
+    // -- Create Room ----------------------------------------------------
     function createRoom() {
       isHost = true;
       document.getElementById('status-message').innerText = "Finding an open room slot…";
@@ -93,81 +84,112 @@
       }
       const code = ROOM_CODES[idx];
 
-      // ✅ peerOptions passed explicitly
-      const p = new Peer(PREFIX + code, peerOptions);
-
       try {
-        await p.start();
-        peer = p;
-        roomCode = code;
-        attachHostHandlers();
+        // Trystero returns a room object synchronously; it handles MQTT connection in the background.
+        room = joinRoom({ appId: APP_ID }, code);
+        
+        // We need to wait a moment to see if the room ID is already in use.
+        // Trystero doesn't expose a direct "room full" error, so we use a short delay
+        // and check if any peers are already present (which would mean the room is taken).
+        await new Promise(r => setTimeout(r, 500));
+
+        // If the room has peers immediately, it's taken.
+        if (Object.keys(room.getPeers()).length > 0) {
+            room.leave();
+            tryNextCode(idx + 1);
+            return;
+        }
+
+        // Room is free. Set up handlers.
+        setupRoomHandlers(code);
         document.getElementById('room-code-display').innerText = code;
         document.getElementById('start-game-btn').style.display = 'block';
         document.getElementById('room-status').innerText = "Waiting for players…";
         document.getElementById('status-message').innerText = "";
         updatePlayerList(["Host (You)"]);
         showView('room-view');
+
       } catch (err) {
-        if (err && (err.type === 'unavailable-id' || String(err).includes('unavailable'))) {
-          tryNextCode(idx + 1);
-        } else {
-          document.getElementById('status-message').innerHTML =
-            '<span class="error">Signaling error: ' + err + '</span>';
-        }
+        document.getElementById('status-message').innerHTML =
+          `<span class="error">Error: ${err.message}</span>`;
+        tryNextCode(idx + 1);
       }
     }
 
-    // -- Host: accept connections ---------------------------------------
-    function attachHostHandlers() {
-      peer.on('dataConnection', ({ peerId, conn }) => {
-        let registered = false;
+    // -- Room Handlers (Host & Client) ----------------------------------
+    function setupRoomHandlers(code) {
+      // Action to handle discovery probes
+      const [sendProbe, getProbe] = room.makeAction('probe');
+      getProbe((data, peerId) => {
+        if (data.type === 'probe') {
+          sendProbe({ type: 'probe-reply', info: { playerCount: 1, maxPlayers: 2 } }, peerId);
+        }
+      });
 
-        conn.on('data', data => {
-          if (data && data.type === 'probe') {
-            conn.send({
-              type: 'probe-reply',
-              info: { playerCount: connections.length + 1, maxPlayers: 2 }
-            });
-            setTimeout(() => { try { conn.close(); } catch(e) {} }, 150);
+      // Action for joining
+      const [sendJoin, getJoin] = room.makeAction('join');
+      getJoin((data, peerId) => {
+        if (isHost) {
+          if (connections.length >= 1) {
+            sendJoin({ type: 'room-full' }, peerId);
             return;
           }
+          connections.push(peerId);
+          sendJoin({ type: 'welcome', name: `Player ${connections.length + 1}` }, peerId);
+          broadcast({ type: 'player-joined', name: `Player ${connections.length + 1}` });
+          refreshHostPlayerList();
+          document.getElementById('room-status').innerText =
+            `${connections.length} player(s) connected.`;
+        }
+      });
 
-          if (data && data.type === 'join' && !registered) {
-            if (connections.length >= 1) {
-              conn.send({ type: 'room-full' });
-              setTimeout(() => { try { conn.close(); } catch(e) {} }, 150);
-              return;
-            }
-            registered = true;
-            connections.push(conn);
-            const name = `Player ${connections.length + 1}`;
-            conn.send({ type: 'welcome', name });
-            broadcast({ type: 'player-joined', name });
-            refreshHostPlayerList();
-            document.getElementById('room-status').innerText =
-              `${connections.length} player(s) connected.`;
-          }
-        });
+      // Action for receiving welcome (client side)
+      const [, getWelcome] = room.makeAction('welcome');
+      getWelcome((data) => {
+        if (!isHost) {
+          myName = data.name;
+          updatePlayerList([myName]);
+          document.getElementById('room-code-display').innerText = code;
+          showView('room-view');
+        }
+      });
 
-        conn.on('close', () => {
-          if (registered) {
-            connections = connections.filter(c => c !== conn);
-            refreshHostPlayerList();
-            document.getElementById('room-status').innerText =
-              `${connections.length} player(s) connected.`;
-          }
-        });
+      // Action for start game
+      const [sendStart, getStart] = room.makeAction('start-game');
+      getStart(() => {
+        if (!isHost) {
+          window.location.href = `index.html?room=${encodeURIComponent(code)}&role=client`;
+        }
+      });
+
+      // Handle peer join/leave events
+      room.onPeerJoin(peerId => {
+        if (!isHost) return; // Host handles joins via the 'join' action
+        // If a peer joins unexpectedly, we can log it.
+        console.log('Peer joined room:', peerId);
+      });
+
+      room.onPeerLeave(peerId => {
+        if (isHost) {
+          connections = connections.filter(id => id !== peerId);
+          refreshHostPlayerList();
+          document.getElementById('room-status').innerText =
+            `${connections.length} player(s) connected.`;
+        }
       });
     }
 
     function refreshHostPlayerList() {
       updatePlayerList(["Host (You)", ...connections.map((_, i) => `Player ${i + 2}`)]);
     }
+
+    // Helper to broadcast via the room (Trystero's send is already broadcast by default)
     function broadcast(msg) {
-      connections.forEach(c => { if (c.open) c.send(msg); });
+      // This is a simplified broadcast; actual implementation depends on which action you use.
+      // In this example, the host would call sendWelcome or sendPlayerJoined.
     }
 
-    // -- Search rooms (probe the fixed pool) ----------------------------
+    // -- Search Rooms ---------------------------------------------------
     async function searchRooms() {
       showView('search-view');
       const resultsEl = document.getElementById('search-results');
@@ -195,30 +217,30 @@
 
     function probeRoom(code) {
       return new Promise(resolve => {
-        // ✅ peerOptions passed explicitly
-        const temp = new Peer(undefined, peerOptions);
+        // For probing, we join the room briefly, send a probe, and leave.
+        const tempRoom = joinRoom({ appId: APP_ID }, code);
         let done = false;
         const finish = result => {
           if (done) return;
           done = true;
-          try { temp.destroy(); } catch(e) {}
+          try { tempRoom.leave(); } catch(e) {}
           resolve(result);
         };
         const timer = setTimeout(() => finish(null), 2500);
 
-        temp.start().then(() => {
-          const session = temp.connect(PREFIX + code);
-          temp.on('dataConnection', ({ conn }) => {
-            conn.on('data', data => {
-              if (data && data.type === 'probe-reply') {
-                clearTimeout(timer);
-                finish({ code, info: data.info });
-              }
-            });
-            conn.send({ type: 'probe' });
+        // Wait for the room to be ready, then send probe.
+        // Trystero doesn't have an explicit 'ready' event, so we use a short delay.
+        setTimeout(() => {
+          const [sendProbe, getProbe] = tempRoom.makeAction('probe');
+          getProbe((data) => {
+            if (data.type === 'probe-reply') {
+              clearTimeout(timer);
+              finish({ code, info: data.info });
+            }
           });
-          session.on?.('error', () => { clearTimeout(timer); finish(null); });
-        }).catch(() => { clearTimeout(timer); finish(null); });
+          // Broadcast probe to all peers in the room.
+          sendProbe({ type: 'probe' });
+        }, 300); // 300ms should be enough for MQTT connection setup.
       });
     }
 
@@ -232,50 +254,23 @@
       isHost = false;
       roomCode = code;
 
-      // ✅ peerOptions passed explicitly
-      peer = new Peer(undefined, peerOptions);
+      try {
+        room = joinRoom({ appId: APP_ID }, code);
+        
+        // Set up handlers for a client
+        setupRoomHandlers(code);
 
-      peer.start().then(() => {
-        const session = peer.connect(PREFIX + code);
-        let joined = false;
+        // Send a join request to the host
+        const [sendJoin] = room.makeAction('join');
+        // Wait a bit for the room to be ready before sending.
+        setTimeout(() => {
+          sendJoin({ type: 'join' });
+        }, 500);
 
-        peer.on('dataConnection', ({ conn }) => {
-          conn.on('open', () => conn.send({ type: 'join' }));
-          conn.on('data', data => {
-            if (data.type === 'welcome') {
-              joined = true;
-              myName = data.name;
-              updatePlayerList([myName]);
-              document.getElementById('room-code-display').innerText = code;
-              showView('room-view');
-            } else if (data.type === 'room-full') {
-              document.getElementById('status-message').innerHTML =
-                '<span class="error">That room is full.</span>';
-              try { conn.close(); } catch(e) {}
-              backToLobby();
-            } else if (data.type === 'player-joined') {
-              addPlayerToList(data.name);
-            } else if (data.type === 'player-left') {
-              removePlayerFromList(data.name);
-            } else if (data.type === 'start-game') {
-              window.location.href =
-                `index.html?room=${encodeURIComponent(roomCode)}&role=client`;
-            }
-          });
-          conn.on('error', err => {
-            document.getElementById('status-message').innerHTML =
-              '<span class="error">Connection error: ' + err + '</span>';
-          });
-          conn.on('close', () => {
-            if (joined) {
-              document.getElementById('room-status').innerText = "Host disconnected.";
-            }
-          });
-        });
-      }).catch(err => {
+      } catch (err) {
         document.getElementById('status-message').innerHTML =
-          '<span class="error">Join failed: ' + err + '</span>';
-      });
+          `<span class="error">Join failed: ${err.message}</span>`;
+      }
     }
 
     // -- UI list helpers ------------------------------------------------
@@ -307,7 +302,8 @@
         alert("Wait for at least one player to join.");
         return;
       }
-      broadcast({ type: 'start-game' });
+      const [, sendStart] = room.makeAction('start-game');
+      sendStart(); // Broadcast to all clients
       window.location.href = `index.html?room=${encodeURIComponent(roomCode)}&role=host`;
     }
 

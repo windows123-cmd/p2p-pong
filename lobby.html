@@ -60,13 +60,9 @@
     // Both brokerUrl and mqttOptions.protocol are forced to wss://
     // to prevent Mixed Content errors on HTTPS pages.
     const peerOptions = {
-      brokerUrl: 'wss://broker.emqx.io:8084/mqtt',
-      securityKey: SECURITY_KEY,
-      mqttOptions: {
-        protocol: 'wss'
-      }
-    };
-
+       brokerUrl: 'wss://broker.emqx.io:8084/mqtt',
+       securityKey: SECURITY_KEY
+     };
     // -- State ----------------------------------------------------------
     let peer = null;
     let isHost = false;

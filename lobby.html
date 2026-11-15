@@ -49,17 +49,16 @@
   <script type="module">
     import { joinRoom as trysteroJoin } from 'https://esm.run/@trystero-p2p/mqtt';
 
-    // -- Configuration -------------------------------------------------
     const APP_ID = 'p2p-pong-windows123-cmd';
     const ROOM_CODES = [];
     for (let i = 1; i <= 12; i++) ROOM_CODES.push("PONG-" + String(i).padStart(2, "0"));
 
-    // Discovery timing — MQTT peer discovery usually lands within 2-4s
-    const CLAIM_DISCOVERY_WAIT_MS = 4000;  // wait before claiming a slot
-    const PROBE_DISCOVERY_WAIT_MS = 3500;  // wait before listing a room
-    const PROBE_TIMEOUT_MS = 5000;
+    const CLAIM_DISCOVERY_WAIT_MS = 4000;
+    const PROBE_DISCOVERY_WAIT_MS = 3500;
+    const PROBE_TIMEOUT_MS        = 5000;
+    const JOIN_RETRY_MS           = 1500;  // retry join every 1.5s once peers appear
+    const JOIN_TIMEOUT_MS         = 15000; // give up after 15s
 
-    // -- State ---------------------------------------------------------
     let room = null;
     let isHost = false;
     let roomCode = "";
@@ -68,9 +67,9 @@
     let sendJoinFn = null;
     let sendStartFn = null;
     let joinTimeout = null;
-    let busy = false;  // prevent double-clicks
+    let joinRetry = null;
+    let busy = false;
 
-    // -- UI helpers ----------------------------------------------------
     function showView(id) {
       ['lobby-view', 'search-view', 'room-view'].forEach(v => {
         document.getElementById(v).style.display = (v === id) ? 'block' : 'none';
@@ -78,7 +77,7 @@
     }
     function backToLobby() { showView('lobby-view'); }
 
-    // -- Create Room ---------------------------------------------------
+    // ---------- CREATE ROOM ----------
     function createRoom() {
       if (busy) return;
       busy = true;
@@ -90,7 +89,7 @@
     async function tryNextCode(idx) {
       if (idx >= ROOM_CODES.length) {
         document.getElementById('status-message').innerHTML =
-          '<span class="error">All room slots are taken. Try again later.</span>';
+          '<span class="error">All room slots taken. Try again later.</span>';
         return;
       }
       const code = ROOM_CODES[idx];
@@ -98,18 +97,14 @@
 
       try {
         tempRoom = trysteroJoin({ appId: APP_ID }, code);
-
-        // Wait for peer discovery before claiming the slot
         await new Promise(r => setTimeout(r, CLAIM_DISCOVERY_WAIT_MS));
 
         const peers = Object.keys(tempRoom.getPeers());
         if (peers.length > 0) {
-          // Someone else is already in this slot — leave and try next
           try { tempRoom.leave(); } catch(e) {}
           return tryNextCode(idx + 1);
         }
 
-        // Slot is free — claim it
         room = tempRoom;
         roomCode = code;
         setupRoomHandlers();
@@ -127,7 +122,7 @@
       }
     }
 
-    // -- Normalise makeAction return shape (array or object) -----------
+    // ---------- ACTION NORMALIZER ----------
     function actionPair(name) {
       const result = room.makeAction(name);
       if (Array.isArray(result)) return [result[0], result[1]];
@@ -141,7 +136,7 @@
       throw new Error(`Unsupported makeAction("${name}") shape`);
     }
 
-    // -- Shared room handlers (host + client) --------------------------
+    // ---------- ROOM HANDLERS ----------
     function setupRoomHandlers() {
       const [, onProbe]              = actionPair('probe');
       const [sendProbeReply]         = actionPair('probe-reply');
@@ -177,14 +172,20 @@
       onWelcome(data => {
         if (isHost) return;
         if (data.type === 'welcome') {
-          if (joinTimeout) { clearTimeout(joinTimeout); joinTimeout = null; }
+          clearTimeout(joinTimeout);
+          clearInterval(joinRetry);
+          joinTimeout = null; joinRetry = null;
+          busy = false;
           myName = data.name;
           updatePlayerList([myName]);
           document.getElementById('room-code-display').innerText = roomCode;
           document.getElementById('room-status').innerText = "Connected.";
           showView('room-view');
         } else if (data.type === 'room-full') {
-          if (joinTimeout) { clearTimeout(joinTimeout); joinTimeout = null; }
+          clearTimeout(joinTimeout);
+          clearInterval(joinRetry);
+          joinTimeout = null; joinRetry = null;
+          busy = false;
           document.getElementById('status-message').innerHTML =
             '<span class="error">That room is full.</span>';
           try { room.leave(); } catch(e) {}
@@ -216,7 +217,7 @@
       updatePlayerList(["Host (You)", ...connections.map((_, i) => `Player ${i + 2}`)]);
     }
 
-    // -- Search rooms --------------------------------------------------
+    // ---------- SEARCH ----------
     async function searchRooms() {
       if (busy) return;
       busy = true;
@@ -229,15 +230,9 @@
       for (let i = 0; i < ROOM_CODES.length; i += BATCH) {
         const batch = ROOM_CODES.slice(i, i + BATCH);
         const batchResults = await Promise.all(batch.map(code => {
-          // Skip our own room — mark it as "(your room)" instead of probing it
           if (room && code === roomCode) {
             return Promise.resolve({
-              code,
-              info: {
-                playerCount: connections.length + 1,
-                maxPlayers: 2,
-                isOwn: true
-              }
+              code, info: { playerCount: connections.length + 1, maxPlayers: 2, isOwn: true }
             });
           }
           return probeRoom(code);
@@ -278,11 +273,8 @@
         try {
           tempRoom = trysteroJoin({ appId: APP_ID }, code);
         } catch (err) {
-          // "already joined" or any other sync error — treat as unavailable
-          resolve(null);
-          return;
+          resolve(null); return;
         }
-
         let done = false;
         const finish = result => {
           if (done) return;
@@ -290,9 +282,7 @@
           try { tempRoom.leave(); } catch(e) {}
           resolve(result);
         };
-
         const timer = setTimeout(() => finish(null), PROBE_TIMEOUT_MS);
-
         setTimeout(() => {
           const peers = Object.keys(tempRoom.getPeers());
           clearTimeout(timer);
@@ -305,7 +295,7 @@
       });
     }
 
-    // -- Join Room -----------------------------------------------------
+    // ---------- JOIN ----------
     function showJoinPrompt() {
       const code = prompt("Enter the room code (e.g. PONG-03):");
       if (code) joinRoom(code.trim().toUpperCase());
@@ -316,25 +306,42 @@
       busy = true;
       isHost = false;
       roomCode = code;
+      document.getElementById('status-message').innerText = "Joining room…";
 
       try {
         room = trysteroJoin({ appId: APP_ID }, code);
         setupRoomHandlers();
 
-        setTimeout(() => {
-          if (sendJoinFn) sendJoinFn({ type: 'join' });
-        }, 800);
+        const startedAt = Date.now();
 
+        // Retry `join` every 1.5s, but only when we can see at least one peer.
+        // This solves the discovery race: the host is usually visible after 2-4s,
+        // and we keep sending until a welcome comes back.
+        joinRetry = setInterval(() => {
+          const peers = Object.keys(room.getPeers());
+          if (peers.length > 0 && sendJoinFn) {
+            sendJoinFn({ type: 'join' });
+          }
+          const elapsed = Math.round((Date.now() - startedAt) / 1000);
+          document.getElementById('status-message').innerText =
+            `Joining ${code}… ${elapsed}s · ${peers.length} peer(s) seen`;
+        }, JOIN_RETRY_MS);
+
+        // Hard timeout
         joinTimeout = setTimeout(() => {
+          clearInterval(joinRetry);
+          joinRetry = null;
+          joinTimeout = null;
           if (document.getElementById('room-view').style.display !== 'block') {
             document.getElementById('status-message').innerHTML =
-              '<span class="error">Room not found or host unreachable.</span>';
+              `<span class="error">No host responded in ${JOIN_TIMEOUT_MS/1000}s. ` +
+              `Is the host tab still open? Is the room code exactly right?</span>`;
             try { room.leave(); } catch(e) {}
             room = null;
             backToLobby();
           }
           busy = false;
-        }, 8000);
+        }, JOIN_TIMEOUT_MS);
       } catch (err) {
         document.getElementById('status-message').innerHTML =
           `<span class="error">Join failed: ${err.message || err}</span>`;
@@ -342,7 +349,7 @@
       }
     }
 
-    // -- UI list helpers -----------------------------------------------
+    // ---------- UI HELPERS ----------
     function updatePlayerList(names) {
       const list = document.getElementById('player-list');
       list.innerHTML = '';
@@ -354,7 +361,7 @@
       });
     }
 
-    // -- Start game ----------------------------------------------------
+    // ---------- START ----------
     function startGame() {
       if (!isHost || connections.length === 0) {
         alert("Wait for at least one player to join.");
@@ -367,7 +374,6 @@
       }, 500);
     }
 
-    // -- Expose for HTML onclick ---------------------------------------
     window.createRoom = createRoom;
     window.searchRooms = searchRooms;
     window.showJoinPrompt = showJoinPrompt;

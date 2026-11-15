@@ -3,7 +3,8 @@
 <head>
   <meta charset="utf-8">
   <title>P2P Pong Lobby</title>
-  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+  <!-- upeerjs: serverless P2P over MQTT -->
+  <script src="https://unpkg.com/upeerjs@0.0.3/dist/upeer.min.js"></script>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 620px; margin: 40px auto; padding: 20px; }
     button { padding: 10px 18px; margin: 5px 5px 5px 0; font-size: 15px; cursor: pointer;
@@ -18,7 +19,6 @@
     #room-code-display { font-size: 24px; font-weight: bold; letter-spacing: 2px; color: #0066cc; }
     #status-message { color: #555; margin-top: 10px; }
     .error { color: #c33; }
-    .hint { color: #888; font-size: 13px; margin-top: 12px; }
   </style>
 </head>
 <body>
@@ -48,16 +48,22 @@
   </div>
 
   <script>
+    // -- Configuration -------------------------------------------------
     const PREFIX = "p2p-pong-";
     const ROOM_CODES = [];
     for (let i = 1; i <= 12; i++) ROOM_CODES.push("PONG-" + String(i).padStart(2, "0"));
 
+    const MQTT_BROKER = "wss://broker.emqx.io:8084/mqtt"; // free public broker
+    const SECURITY_KEY = "p2p-pong-shared-secret";       // E2E encryption for signaling
+
+    // -- State ----------------------------------------------------------
     let peer = null;
     let isHost = false;
     let roomCode = "";
-    let connections = [];
+    let connections = [];       // host: client sessions; client: one session
     let myName = "Player";
 
+    // -- UI helpers -----------------------------------------------------
     function showView(id) {
       ['lobby-view', 'search-view', 'room-view'].forEach(v => {
         document.getElementById(v).style.display = (v === id) ? 'block' : 'none';
@@ -65,39 +71,30 @@
     }
     function backToLobby() { showView('lobby-view'); }
 
-    // ---------- CREATE ROOM (claim first available code in pool) ----------
-
+    // -- Create Room (claim first free slot) ----------------------------
     function createRoom() {
       isHost = true;
       document.getElementById('status-message').innerText = "Finding an open room slot…";
       tryNextCode(0);
     }
 
-    function tryNextCode(idx) {
+    async function tryNextCode(idx) {
       if (idx >= ROOM_CODES.length) {
         document.getElementById('status-message').innerHTML =
           '<span class="error">All room slots are taken. Try again later.</span>';
         return;
       }
       const code = ROOM_CODES[idx];
-      const attempt = new Peer(PREFIX + code);
-      let failed = false;
 
-      attempt.on('error', err => {
-        if (failed) return;
-        failed = true;
-        try { attempt.destroy(); } catch(e) {}
-        if (err.type === 'unavailable-id') {
-          tryNextCode(idx + 1);
-        } else {
-          document.getElementById('status-message').innerHTML =
-            '<span class="error">Error: ' + err.type + '</span>';
-        }
+      // upeerjs Peer: same API shape as PeerJS, but MQTT signaling
+      const p = new Peer(PREFIX + code, {
+        brokerUrl: MQTT_BROKER,
+        securityKey: SECURITY_KEY,
       });
 
-      attempt.on('open', () => {
-        if (failed) return;
-        peer = attempt;
+      try {
+        await p.start();                 // opens MQTT + registers ID
+        peer = p;
         roomCode = code;
         attachHostHandlers();
         document.getElementById('room-code-display').innerText = code;
@@ -106,30 +103,35 @@
         document.getElementById('status-message').innerText = "";
         updatePlayerList(["Host (You)"]);
         showView('room-view');
-      });
+      } catch (err) {
+        // If the ID is taken, move to the next slot
+        if (err && (err.type === 'unavailable-id' || String(err).includes('unavailable'))) {
+          tryNextCode(idx + 1);
+        } else {
+          document.getElementById('status-message').innerHTML =
+            '<span class="error">Signaling error: ' + err + '</span>';
+        }
+      }
     }
 
+    // -- Host: accept connections ---------------------------------------
     function attachHostHandlers() {
-      peer.on('connection', conn => {
+      peer.on('dataConnection', ({ peerId, conn }) => {
         let registered = false;
-        const probeTimer = setTimeout(() => {
-          if (!registered) { try { conn.close(); } catch(e) {} }
-        }, 2000);
 
+        // Handle discovery probe first
         conn.on('data', data => {
-          // 1. Discovery probe — reply and hang up, don't count as player
-          if (data.type === 'probe') {
-            clearTimeout(probeTimer);
+          if (data && data.type === 'probe') {
             conn.send({
               type: 'probe-reply',
               info: { playerCount: connections.length + 1, maxPlayers: 2 }
             });
+            // Close the probe session shortly after replying
             setTimeout(() => { try { conn.close(); } catch(e) {} }, 150);
             return;
           }
-          // 2. Real join
-          if (data.type === 'join' && !registered) {
-            clearTimeout(probeTimer);
+
+          if (data && data.type === 'join' && !registered) {
             if (connections.length >= 1) {
               conn.send({ type: 'room-full' });
               setTimeout(() => { try { conn.close(); } catch(e) {} }, 150);
@@ -147,7 +149,6 @@
         });
 
         conn.on('close', () => {
-          clearTimeout(probeTimer);
           if (registered) {
             connections = connections.filter(c => c !== conn);
             refreshHostPlayerList();
@@ -165,68 +166,66 @@
       connections.forEach(c => { if (c.open) c.send(msg); });
     }
 
-    // ---------- SEARCH OPEN ROOMS ----------
-
+    // -- Search rooms (probe the fixed pool) ----------------------------
     async function searchRooms() {
       showView('search-view');
       const resultsEl = document.getElementById('search-results');
-      resultsEl.innerHTML = `<p>Searching ${ROOM_CODES.length} room slots in parallel…</p>`;
+      resultsEl.innerHTML = `<p>Probing ${ROOM_CODES.length} room slots…</p>`;
 
-      // Probe every known slot at the same time
       const results = await Promise.all(ROOM_CODES.map(code => probeRoom(code)));
 
       if (results.every(r => r === null)) {
-        resultsEl.innerHTML =
-          '<p>No open rooms right now. Create one and invite a friend!</p>';
+        resultsEl.innerHTML = '<p>No open rooms right now. Create one!</p>';
         return;
       }
 
       resultsEl.innerHTML = '';
-      results
-        .filter(r => r !== null)
-        .forEach(room => {
-          const full = room.info.playerCount >= room.info.maxPlayers;
-          const div = document.createElement('div');
-          div.className = 'room-item' + (full ? ' full' : '');
-          div.innerHTML = `
-            <span><strong>${room.code}</strong> — ${room.info.playerCount}/${room.info.maxPlayers} players${full ? ' (full)' : ''}</span>
-            <button ${full ? 'disabled' : ''} onclick="joinRoom('${room.code}')">${full ? 'Full' : 'Join'}</button>
-          `;
-          resultsEl.appendChild(div);
-        });
+      results.filter(r => r !== null).forEach(room => {
+        const full = room.info.playerCount >= room.info.maxPlayers;
+        const div = document.createElement('div');
+        div.className = 'room-item' + (full ? ' full' : '');
+        div.innerHTML = `
+          <span><strong>${room.code}</strong> — ${room.info.playerCount}/${room.info.maxPlayers} players${full ? ' (full)' : ''}</span>
+          <button ${full ? 'disabled' : ''} onclick="joinRoom('${room.code}')">${full ? 'Full' : 'Join'}</button>
+        `;
+        resultsEl.appendChild(div);
+      });
     }
 
     function probeRoom(code) {
       return new Promise(resolve => {
-        const probe = new Peer();
+        const temp = new Peer(undefined, { // random temporary ID
+          brokerUrl: MQTT_BROKER,
+          securityKey: SECURITY_KEY,
+        });
         let done = false;
         const finish = result => {
           if (done) return;
           done = true;
-          try { probe.destroy(); } catch(e) {}
+          try { temp.destroy(); } catch(e) {}
           resolve(result);
         };
         const timer = setTimeout(() => finish(null), 2500);
 
-        probe.on('open', () => {
-          const conn = probe.connect(PREFIX + code);
-          conn.on('open', () => conn.send({ type: 'probe' }));
-          conn.on('data', data => {
-            if (data.type === 'probe-reply') {
-              clearTimeout(timer);
-              finish({ code, info: data.info });
-            }
+        temp.start().then(() => {
+          const session = temp.connect(PREFIX + code);
+          // Listen for data on the outgoing session
+          temp.on('dataConnection', ({ conn }) => {
+            conn.on('data', data => {
+              if (data && data.type === 'probe-reply') {
+                clearTimeout(timer);
+                finish({ code, info: data.info });
+              }
+            });
+            conn.send({ type: 'probe' });
           });
-          conn.on('error', () => { clearTimeout(timer); finish(null); });
-          conn.on('close', () => { clearTimeout(timer); finish(null); });
-        });
-
-        probe.on('error', () => { clearTimeout(timer); finish(null); });
+          // If the session errors, mark as unavailable
+          session.on?.('error', () => { clearTimeout(timer); finish(null); });
+        }).catch(() => { clearTimeout(timer); finish(null); });
       });
     }
 
-    // ---------- JOIN ROOM ----------
-
+    // -- Join Room ------------------------------------------------------
     function showJoinPrompt() {
       const code = prompt("Enter the room code (e.g. PONG-03):");
       if (code) joinRoom(code.trim().toUpperCase());
@@ -235,55 +234,57 @@
     function joinRoom(code) {
       isHost = false;
       roomCode = code;
-      peer = new Peer();
 
-      peer.on('open', () => {
-        const conn = peer.connect(PREFIX + code);
-        let joined = false;
-
-        conn.on('open', () => conn.send({ type: 'join' }));
-
-        conn.on('data', data => {
-          if (data.type === 'welcome') {
-            joined = true;
-            myName = data.name;
-            updatePlayerList([myName]);
-            document.getElementById('room-code-display').innerText = code;
-            showView('room-view');
-          } else if (data.type === 'room-full') {
-            document.getElementById('status-message').innerHTML =
-              '<span class="error">That room is full.</span>';
-            try { conn.close(); } catch(e) {}
-            backToLobby();
-          } else if (data.type === 'player-joined') {
-            addPlayerToList(data.name);
-          } else if (data.type === 'player-left') {
-            removePlayerFromList(data.name);
-          } else if (data.type === 'start-game') {
-            window.location.href =
-              `index.html?room=${encodeURIComponent(roomCode)}&role=client`;
-          }
-        });
-
-        conn.on('error', err => {
-          document.getElementById('status-message').innerHTML =
-            '<span class="error">Connection error: ' + err + '</span>';
-        });
-        conn.on('close', () => {
-          if (joined) {
-            document.getElementById('room-status').innerText = "Host disconnected.";
-          }
-        });
+      peer = new Peer(undefined, { // random client ID
+        brokerUrl: MQTT_BROKER,
+        securityKey: SECURITY_KEY,
       });
 
-      peer.on('error', err => {
+      peer.start().then(() => {
+        const session = peer.connect(PREFIX + code);
+        let joined = false;
+
+        peer.on('dataConnection', ({ conn }) => {
+          // If this is the session we just opened, attach handlers
+          conn.on('open', () => conn.send({ type: 'join' }));
+          conn.on('data', data => {
+            if (data.type === 'welcome') {
+              joined = true;
+              myName = data.name;
+              updatePlayerList([myName]);
+              document.getElementById('room-code-display').innerText = code;
+              showView('room-view');
+            } else if (data.type === 'room-full') {
+              document.getElementById('status-message').innerHTML =
+                '<span class="error">That room is full.</span>';
+              try { conn.close(); } catch(e) {}
+              backToLobby();
+            } else if (data.type === 'player-joined') {
+              addPlayerToList(data.name);
+            } else if (data.type === 'player-left') {
+              removePlayerFromList(data.name);
+            } else if (data.type === 'start-game') {
+              window.location.href =
+                `index.html?room=${encodeURIComponent(roomCode)}&role=client`;
+            }
+          });
+          conn.on('error', err => {
+            document.getElementById('status-message').innerHTML =
+              '<span class="error">Connection error: ' + err + '</span>';
+          });
+          conn.on('close', () => {
+            if (joined) {
+              document.getElementById('room-status').innerText = "Host disconnected.";
+            }
+          });
+        });
+      }).catch(err => {
         document.getElementById('status-message').innerHTML =
-          '<span class="error">Error: ' + err.type + '</span>';
+          '<span class="error">Join failed: ' + err + '</span>';
       });
     }
 
-    // ---------- UI HELPERS ----------
-
+    // -- UI list helpers ------------------------------------------------
     function updatePlayerList(names) {
       const list = document.getElementById('player-list');
       list.innerHTML = '';
@@ -306,8 +307,7 @@
       });
     }
 
-    // ---------- START GAME ----------
-
+    // -- Start game -----------------------------------------------------
     function startGame() {
       if (!isHost || connections.length === 0) {
         alert("Wait for at least one player to join.");
@@ -319,3 +319,4 @@
   </script>
 </body>
 </html>
+

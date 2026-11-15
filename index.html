@@ -22,6 +22,7 @@
     import { joinRoom as trysteroJoin } from 'https://esm.run/@trystero-p2p/mqtt';
 
     const APP_ID = 'p2p-pong-windows123-cmd';
+    const GAME_SUFFIX = '-game';
     const W = 800, H = 500;
     const PADDLE_W = 12, PADDLE_H = 80, PADDLE_SPEED = 6, BALL_R = 8;
     const TICK_MS = 1000 / 60;
@@ -45,31 +46,36 @@
     function draw(s) {
       ctx.fillStyle = '#0a0a0a';
       ctx.fillRect(0, 0, W, H);
-
       ctx.strokeStyle = '#333';
       ctx.setLineDash([8, 12]);
       ctx.beginPath(); ctx.moveTo(W/2, 0); ctx.lineTo(W/2, H); ctx.stroke();
       ctx.setLineDash([]);
-
       ctx.fillStyle = '#ff5555';
       ctx.fillRect(20, s.paddles[0].y - PADDLE_H/2, PADDLE_W, PADDLE_H);
       ctx.fillStyle = '#5599ff';
       ctx.fillRect(W - 20 - PADDLE_W, s.paddles[1].y - PADDLE_H/2, PADDLE_W, PADDLE_H);
-
       ctx.fillStyle = '#fff';
       ctx.shadowColor = '#fff'; ctx.shadowBlur = 12;
       ctx.beginPath();
       ctx.arc(s.ball.x, s.ball.y, BALL_R, 0, Math.PI * 2);
       ctx.fill();
       ctx.shadowBlur = 0;
-
       ctx.font = 'bold 48px monospace';
       ctx.textAlign = 'center';
       ctx.fillStyle = '#ff5555'; ctx.fillText(s.scores[0], W/4, 64);
       ctx.fillStyle = '#5599ff'; ctx.fillText(s.scores[1], 3*W/4, 64);
     }
 
-    const room = trysteroJoin({ appId: APP_ID }, roomCode);
+    // ⚠ Join a DIFFERENT room than the lobby used, to avoid the
+    // "already joined" / dead-room-object problem across page loads.
+    let room;
+    try {
+      room = trysteroJoin({ appId: APP_ID }, roomCode + GAME_SUFFIX);
+    } catch (err) {
+      statusEl.innerHTML =
+        `Failed to join game room: ${err.message}. <a href="lobby.html">Back to lobby</a>`;
+      throw err;
+    }
 
     function actionPair(name) {
       const r = room.makeAction(name);
@@ -98,7 +104,8 @@
       const peerCount = Object.keys(room.getPeers()).length;
       connected = peerCount > 0;
       if (!connected) {
-        statusEl.innerText = `Waiting for opponent… (room ${roomCode} · ${role})`;
+        statusEl.innerText =
+          `Waiting for opponent… (room ${roomCode} · ${role} · ${peerCount} peer${peerCount===1?'':'s'})`;
       } else if (role === 'client' && !hasState) {
         statusEl.innerText = `Connected — waiting for game data…`;
       } else {
@@ -122,7 +129,6 @@
 
       setInterval(() => {
         if (!connected) return;
-
         if (keys.ArrowUp) state.paddles[0].y -= PADDLE_SPEED;
         if (keys.ArrowDown) state.paddles[0].y += PADDLE_SPEED;
         state.paddles[0].y = clampPaddle(state.paddles[0].y);
@@ -139,7 +145,6 @@
           b.vx = Math.abs(b.vx);
           b.x = 20 + PADDLE_W + BALL_R;
         }
-
         const px1 = W - 20 - PADDLE_W;
         const py1 = state.paddles[1].y - PADDLE_H/2;
         if (b.x + BALL_R > px1 && b.x - BALL_R < px1 + PADDLE_W
@@ -148,7 +153,6 @@
           b.vx = -Math.abs(b.vx);
           b.x = px1 - BALL_R;
         }
-
         if (b.x + BALL_R < 0) {
           state.scores[1]++;
           b.x = W/2; b.y = H/2; b.vx = -5; b.vy = 3;

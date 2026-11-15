@@ -58,6 +58,7 @@
     const PROBE_TIMEOUT_MS        = 5000;
     const JOIN_RETRY_MS           = 1500;
     const JOIN_TIMEOUT_MS         = 15000;
+    const MAX_PLAYERS             = 2;
 
     let room = null;
     let isHost = false;
@@ -76,6 +77,17 @@
       });
     }
     function backToLobby() { showView('lobby-view'); }
+
+    function updateRoomStatus() {
+      const total = connections.length + 1;
+      const el = document.getElementById('room-status');
+      if (!el) return;
+      if (connections.length === 0) {
+        el.innerText = `Players: ${total}/${MAX_PLAYERS} — waiting for an opponent…`;
+      } else {
+        el.innerText = `Players: ${total}/${MAX_PLAYERS} — ready! Click Start Game.`;
+      }
+    }
 
     function createRoom() {
       if (busy) return;
@@ -109,9 +121,9 @@
         setupRoomHandlers();
         document.getElementById('room-code-display').innerText = code;
         document.getElementById('start-game-btn').style.display = 'block';
-        document.getElementById('room-status').innerText = "Waiting for players…";
         document.getElementById('status-message').innerText = "";
         updatePlayerList(["Host (You)"]);
+        updateRoomStatus();
         showView('room-view');
       } catch (err) {
         try { if (tempRoom) tempRoom.leave(); } catch(e) {}
@@ -147,14 +159,14 @@
       onProbe((data, peerId) => {
         if (!isHost) return;
         sendProbeReply(
-          { info: { playerCount: connections.length, maxPlayers: 2 } },
+          { info: { playerCount: connections.length + 1, maxPlayers: MAX_PLAYERS } },
           peerId
         );
       });
 
       onJoin((data, peerId) => {
         if (!isHost) return;
-        if (connections.length >= 1 && !connections.includes(peerId)) {
+        if (connections.length >= (MAX_PLAYERS - 1) && !connections.includes(peerId)) {
           sendWelcome({ type: 'room-full' }, peerId);
           return;
         }
@@ -162,8 +174,7 @@
         const name = `Player ${connections.length + 1}`;
         sendWelcome({ type: 'welcome', name }, peerId);
         refreshHostPlayerList();
-        document.getElementById('room-status').innerText =
-          `${connections.length} player(s) connected.`;
+        updateRoomStatus();
       });
 
       onWelcome(data => {
@@ -176,7 +187,7 @@
           myName = data.name;
           updatePlayerList([myName]);
           document.getElementById('room-code-display').innerText = roomCode;
-          document.getElementById('room-status').innerText = "Connected.";
+          document.getElementById('room-status').innerText = "Connected — waiting for host to start.";
           showView('room-view');
         } else if (data.type === 'room-full') {
           clearTimeout(joinTimeout);
@@ -203,8 +214,7 @@
         if (isHost) {
           connections = connections.filter(id => id !== peerId);
           refreshHostPlayerList();
-          document.getElementById('room-status').innerText =
-            `${connections.length} player(s) connected.`;
+          updateRoomStatus();
         } else {
           document.getElementById('room-status').innerText = "Host disconnected.";
         }
@@ -229,7 +239,11 @@
         const batchResults = await Promise.all(batch.map(code => {
           if (room && code === roomCode) {
             return Promise.resolve({
-              code, info: { playerCount: connections.length + 1, maxPlayers: 2, isOwn: true }
+              code, info: {
+                playerCount: connections.length + 1,
+                maxPlayers: MAX_PLAYERS,
+                isOwn: true
+              }
             });
           }
           return probeRoom(code);
@@ -284,7 +298,7 @@
           const peers = Object.keys(tempRoom.getPeers());
           clearTimeout(timer);
           if (peers.length > 0) {
-            finish({ code, info: { playerCount: peers.length, maxPlayers: 2 } });
+            finish({ code, info: { playerCount: peers.length, maxPlayers: MAX_PLAYERS } });
           } else {
             finish(null);
           }
@@ -312,9 +326,7 @@
 
         joinRetry = setInterval(() => {
           const peers = Object.keys(room.getPeers());
-          if (peers.length > 0 && sendJoinFn) {
-            sendJoinFn({ type: 'join' });
-          }
+          if (peers.length > 0 && sendJoinFn) sendJoinFn({ type: 'join' });
           const elapsed = Math.round((Date.now() - startedAt) / 1000);
           document.getElementById('status-message').innerText =
             `Joining ${code}… ${elapsed}s · ${peers.length} peer(s) seen`;
@@ -356,8 +368,6 @@
         alert("Wait for at least one player to join.");
         return;
       }
-      // Fire the start signal multiple times so the client cannot miss it,
-      // THEN navigate the host.
       let sent = 0;
       const sendInterval = setInterval(() => {
         if (sendStartFn) sendStartFn();

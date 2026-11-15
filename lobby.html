@@ -56,8 +56,8 @@
     const CLAIM_DISCOVERY_WAIT_MS = 4000;
     const PROBE_DISCOVERY_WAIT_MS = 3500;
     const PROBE_TIMEOUT_MS        = 5000;
-    const JOIN_RETRY_MS           = 1500;  // retry join every 1.5s once peers appear
-    const JOIN_TIMEOUT_MS         = 15000; // give up after 15s
+    const JOIN_RETRY_MS           = 1500;
+    const JOIN_TIMEOUT_MS         = 15000;
 
     let room = null;
     let isHost = false;
@@ -77,7 +77,6 @@
     }
     function backToLobby() { showView('lobby-view'); }
 
-    // ---------- CREATE ROOM ----------
     function createRoom() {
       if (busy) return;
       busy = true;
@@ -122,7 +121,6 @@
       }
     }
 
-    // ---------- ACTION NORMALIZER ----------
     function actionPair(name) {
       const result = room.makeAction(name);
       if (Array.isArray(result)) return [result[0], result[1]];
@@ -136,7 +134,6 @@
       throw new Error(`Unsupported makeAction("${name}") shape`);
     }
 
-    // ---------- ROOM HANDLERS ----------
     function setupRoomHandlers() {
       const [, onProbe]              = actionPair('probe');
       const [sendProbeReply]         = actionPair('probe-reply');
@@ -196,6 +193,7 @@
 
       onStart(() => {
         if (!isHost) {
+          console.log('[lobby] start received — navigating to game');
           window.location.href =
             `index.html?room=${encodeURIComponent(roomCode)}&role=client`;
         }
@@ -217,7 +215,6 @@
       updatePlayerList(["Host (You)", ...connections.map((_, i) => `Player ${i + 2}`)]);
     }
 
-    // ---------- SEARCH ----------
     async function searchRooms() {
       if (busy) return;
       busy = true;
@@ -295,7 +292,6 @@
       });
     }
 
-    // ---------- JOIN ----------
     function showJoinPrompt() {
       const code = prompt("Enter the room code (e.g. PONG-03):");
       if (code) joinRoom(code.trim().toUpperCase());
@@ -314,9 +310,6 @@
 
         const startedAt = Date.now();
 
-        // Retry `join` every 1.5s, but only when we can see at least one peer.
-        // This solves the discovery race: the host is usually visible after 2-4s,
-        // and we keep sending until a welcome comes back.
         joinRetry = setInterval(() => {
           const peers = Object.keys(room.getPeers());
           if (peers.length > 0 && sendJoinFn) {
@@ -327,15 +320,13 @@
             `Joining ${code}… ${elapsed}s · ${peers.length} peer(s) seen`;
         }, JOIN_RETRY_MS);
 
-        // Hard timeout
         joinTimeout = setTimeout(() => {
           clearInterval(joinRetry);
           joinRetry = null;
           joinTimeout = null;
           if (document.getElementById('room-view').style.display !== 'block') {
             document.getElementById('status-message').innerHTML =
-              `<span class="error">No host responded in ${JOIN_TIMEOUT_MS/1000}s. ` +
-              `Is the host tab still open? Is the room code exactly right?</span>`;
+              `<span class="error">No host responded in ${JOIN_TIMEOUT_MS/1000}s.</span>`;
             try { room.leave(); } catch(e) {}
             room = null;
             backToLobby();
@@ -349,7 +340,6 @@
       }
     }
 
-    // ---------- UI HELPERS ----------
     function updatePlayerList(names) {
       const list = document.getElementById('player-list');
       list.innerHTML = '';
@@ -361,17 +351,23 @@
       });
     }
 
-    // ---------- START ----------
     function startGame() {
       if (!isHost || connections.length === 0) {
         alert("Wait for at least one player to join.");
         return;
       }
-      if (sendStartFn) sendStartFn();
-      setTimeout(() => {
-        window.location.href =
-          `index.html?room=${encodeURIComponent(roomCode)}&role=host`;
-      }, 500);
+      // Fire the start signal multiple times so the client cannot miss it,
+      // THEN navigate the host.
+      let sent = 0;
+      const sendInterval = setInterval(() => {
+        if (sendStartFn) sendStartFn();
+        sent++;
+        if (sent >= 5) {
+          clearInterval(sendInterval);
+          window.location.href =
+            `index.html?room=${encodeURIComponent(roomCode)}&role=host`;
+        }
+      }, 400);
     }
 
     window.createRoom = createRoom;

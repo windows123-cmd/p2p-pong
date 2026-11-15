@@ -2,207 +2,200 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>P2P Pong Lobby</title>
-  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+  <title>P2P Pong</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 500px; margin: 40px auto; padding: 20px; }
-    button { padding: 10px 20px; margin: 5px; font-size: 16px; cursor: pointer; }
-    #lobby-view, #room-view { display: none; margin-top: 20px; }
-    .player-item { padding: 8px; background: #f0f0f0; margin: 4px 0; border-radius: 4px; }
-    #room-code-display { font-size: 24px; font-weight: bold; letter-spacing: 2px; color: #0066cc; }
-    #status-message { color: #555; margin-top: 10px; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; background: #0a0a0a; color: #eee;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      font-family: system-ui, monospace;
+    }
+    canvas { display: block; border-radius: 8px; box-shadow: 0 0 40px rgba(255,255,255,0.05); }
+    #status { margin-top: 14px; font-size: 13px; color: #888; text-align: center; }
+    a { color: #5599ff; }
   </style>
 </head>
 <body>
-  <h1>🎮 P2P Pong Lobby</h1>
+  <canvas id="c" width="800" height="500"></canvas>
+  <div id="status">Connecting…</div>
+  <script type="module">
+    import { joinRoom as trysteroJoin } from 'https://esm.run/@trystero-p2p/mqtt';
 
-  <!-- Initial view: create or join -->
-  <div id="lobby-view" style="display:block;">
-    <button onclick="createRoom()">Create Room (Host)</button>
-    <button onclick="showJoinPrompt()">Join Room (Client)</button>
-    <p id="status-message"></p>
-  </div>
+    const APP_ID = 'p2p-pong-windows123-cmd';
+    const W = 800, H = 500;
+    const PADDLE_W = 12, PADDLE_H = 80, PADDLE_SPEED = 6, BALL_R = 8;
+    const TICK_MS = 1000 / 60;
+    const STATE_HZ = 30;
 
-  <!-- Room view: share code, see players -->
-  <div id="room-view">
-    <p>Room Code: <span id="room-code-display"></span></p>
-    <p>Share this code with friends. They select "Join Room" and enter it.</p>
-    <h3>Players in Room:</h3>
-    <ul id="player-list"></ul>
-    <button id="start-game-btn" onclick="startGame()" style="display:none;">Start Game</button>
-    <p id="room-status"></p>
-  </div>
+    const params = new URLSearchParams(location.search);
+    const roomCode = params.get('room');
+    const role = params.get('role');
 
-  <script>
-    const PREFIX = "p2p-pong-"; // Unique prefix to avoid collisions on the public server
-    let peer = null;
-    let isHost = false;
-    let roomCode = "";
-    let connections = []; // Host: all client connections. Client: single connection to host.
-    let myName = "Player";
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
 
-    // --- UTILITIES ---
+    if (!roomCode || !role) {
+      statusEl.innerHTML = 'Missing room/role. <a href="lobby.html">Back to lobby</a>';
+      throw new Error('no params');
+    }
 
-    function generateRoomCode() {
-      // Avoid ambiguous characters (no O/0, I/1) for easy sharing[reference:4]
-      const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-      let code = "";
-      for (let i = 0; i < 5; i++) {
-        code += chars.charAt(Math.floor(Math.random() * chars.length));
+    function clampPaddle(y) { return Math.max(PADDLE_H/2, Math.min(H - PADDLE_H/2, y)); }
+
+    function draw(s) {
+      ctx.fillStyle = '#0a0a0a';
+      ctx.fillRect(0, 0, W, H);
+
+      ctx.strokeStyle = '#333';
+      ctx.setLineDash([8, 12]);
+      ctx.beginPath(); ctx.moveTo(W/2, 0); ctx.lineTo(W/2, H); ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.fillStyle = '#ff5555';
+      ctx.fillRect(20, s.paddles[0].y - PADDLE_H/2, PADDLE_W, PADDLE_H);
+      ctx.fillStyle = '#5599ff';
+      ctx.fillRect(W - 20 - PADDLE_W, s.paddles[1].y - PADDLE_H/2, PADDLE_W, PADDLE_H);
+
+      ctx.fillStyle = '#fff';
+      ctx.shadowColor = '#fff'; ctx.shadowBlur = 12;
+      ctx.beginPath();
+      ctx.arc(s.ball.x, s.ball.y, BALL_R, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+
+      ctx.font = 'bold 48px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#ff5555'; ctx.fillText(s.scores[0], W/4, 64);
+      ctx.fillStyle = '#5599ff'; ctx.fillText(s.scores[1], 3*W/4, 64);
+    }
+
+    const room = trysteroJoin({ appId: APP_ID }, roomCode);
+
+    function actionPair(name) {
+      const r = room.makeAction(name);
+      if (Array.isArray(r)) return [r[0], r[1]];
+      if (r && typeof r === 'object') {
+        const send = r.send?.bind(r);
+        const receive = r.onMessage ? r.onMessage.bind(r) : r.receive?.bind(r);
+        if (send && receive) return [send, receive];
       }
-      return code;
+      throw new Error(`bad action ${name}`);
     }
 
-    function showRoomView(code) {
-      document.getElementById('lobby-view').style.display = 'none';
-      document.getElementById('room-view').style.display = 'block';
-      document.getElementById('room-code-display').innerText = code;
-    }
+    const [sendInput, onInput] = actionPair('input');
+    const [sendState, onState] = actionPair('state');
 
-    function updatePlayerList(names) {
-      const list = document.getElementById('player-list');
-      list.innerHTML = '';
-      names.forEach(name => {
-        const li = document.createElement('li');
-        li.className = 'player-item';
-        li.innerText = name;
-        list.appendChild(li);
-      });
-    }
+    const state = {
+      ball: { x: W/2, y: H/2, vx: 5, vy: 3 },
+      paddles: [{ y: H/2 }, { y: H/2 }],
+      scores: [0, 0],
+    };
 
-    // --- HOST LOGIC ---
+    let connected = false;
+    let hasState = false;
 
-    function createRoom() {
-      isHost = true;
-      roomCode = generateRoomCode();
-      const fullPeerId = PREFIX + roomCode;
-
-      peer = new Peer(fullPeerId);
-
-      peer.on('open', (id) => {
-        document.getElementById('status-message').innerText = "Room created!";
-        showRoomView(roomCode);
-        document.getElementById('start-game-btn').style.display = 'block';
-        document.getElementById('room-status').innerText = "Waiting for players to join...";
-        updatePlayerList(["Host (You)"]);
-      });
-
-      peer.on('error', (err) => {
-        document.getElementById('status-message').innerText = "Error: " + err.type;
-      });
-
-      // A new client is trying to connect
-      peer.on('connection', (conn) => {
-        connections.push(conn);
-        const playerName = `Player ${connections.length + 1}`;
-
-        conn.on('open', () => {
-          // Tell the new client their assigned name
-          conn.send({ type: 'welcome', name: playerName });
-          // Tell everyone else about the new player
-          broadcast({ type: 'player-joined', name: playerName });
-          refreshHostPlayerList();
-          document.getElementById('room-status').innerText =
-            `${connections.length} player(s) connected.`;
-        });
-
-        conn.on('data', (data) => {
-          // Clients might send a ready signal or their own name
-          if (data.type === 'join') {
-            conn.send({ type: 'welcome', name: playerName });
-          }
-        });
-
-        conn.on('close', () => {
-          connections = connections.filter(c => c !== conn);
-          broadcast({ type: 'player-left', name: playerName });
-          refreshHostPlayerList();
-          document.getElementById('room-status').innerText =
-            `${connections.length} player(s) connected.`;
-        });
-      });
-    }
-
-    function refreshHostPlayerList() {
-      const names = ["Host (You)", ...connections.map((_, i) => `Player ${i + 2}`)];
-      updatePlayerList(names);
-    }
-
-    function broadcast(message) {
-      connections.forEach(conn => {
-        if (conn.open) conn.send(message);
-      });
-    }
-
-    // --- CLIENT LOGIC ---
-
-    function showJoinPrompt() {
-      const code = prompt("Enter the 5-character Room Code:");
-      if (!code) return;
-      joinRoom(code.trim().toUpperCase());
-    }
-
-    function joinRoom(code) {
-      isHost = false;
-      roomCode = code;
-      const fullPeerId = PREFIX + roomCode;
-
-      peer = new Peer(); // Random ID for the client
-
-      peer.on('open', () => {
-        const conn = peer.connect(fullPeerId);
-        connections.push(conn); // Client keeps only this one connection
-
-        conn.on('open', () => {
-          document.getElementById('status-message').innerText = "Connected!";
-          showRoomView(code);
-          conn.send({ type: 'join' });
-        });
-
-        conn.on('data', (data) => {
-          if (data.type === 'welcome') {
-            myName = data.name;
-            updatePlayerList([myName]);
-          }
-          if (data.type === 'player-joined') {
-            // Client receives the new player's name and adds it
-            const list = document.getElementById('player-list');
-            const li = document.createElement('li');
-            li.className = 'player-item';
-            li.innerText = data.name;
-            list.appendChild(li);
-          }
-          if (data.type === 'player-left') {
-            // Remove the player from the list (simplified)
-            const items = document.querySelectorAll('.player-item');
-            items.forEach(item => {
-              if (item.innerText === data.name) item.remove();
-            });
-          }
-          if (data.type === 'start-game') {
-            // This is where the handoff to the game happens
-            window.location.href = `index.html?room=${roomCode}&role=client&name=${encodeURIComponent(myName)}`;
-          }
-        });
-
-        conn.on('error', (err) => {
-          document.getElementById('status-message').innerText = "Connection error: " + err;
-        });
-      });
-    }
-
-    // --- START GAME ---
-
-    function startGame() {
-      if (!isHost || connections.length === 0) {
-        alert("Wait for at least one player to join.");
-        return;
+    function updateConnectionStatus() {
+      const peerCount = Object.keys(room.getPeers()).length;
+      connected = peerCount > 0;
+      if (!connected) {
+        statusEl.innerText = `Waiting for opponent… (room ${roomCode} · ${role})`;
+      } else if (role === 'client' && !hasState) {
+        statusEl.innerText = `Connected — waiting for game data…`;
+      } else {
+        statusEl.innerText = `Playing as ${role} · room ${roomCode}`;
       }
-      // Tell all clients to go to the game page
-      broadcast({ type: 'start-game' });
-      // Host also goes to the game page
-      window.location.href = `index.html?room=${roomCode}&role=host`;
     }
+    setInterval(updateConnectionStatus, 500);
+    updateConnectionStatus();
+
+    const keys = {};
+    window.addEventListener('keydown', e => {
+      keys[e.key] = true;
+      if (e.key.startsWith('Arrow')) e.preventDefault();
+    });
+    window.addEventListener('keyup', e => { keys[e.key] = false; });
+
+    if (role === 'host') {
+      onInput(data => {
+        state.paddles[1].y = clampPaddle(data.y);
+      });
+
+      setInterval(() => {
+        if (!connected) return;
+
+        if (keys.ArrowUp) state.paddles[0].y -= PADDLE_SPEED;
+        if (keys.ArrowDown) state.paddles[0].y += PADDLE_SPEED;
+        state.paddles[0].y = clampPaddle(state.paddles[0].y);
+
+        const b = state.ball;
+        b.x += b.vx; b.y += b.vy;
+        if (b.y - BALL_R < 0) { b.y = BALL_R; b.vy *= -1; }
+        if (b.y + BALL_R > H) { b.y = H - BALL_R; b.vy *= -1; }
+
+        const py0 = state.paddles[0].y - PADDLE_H/2;
+        if (b.x - BALL_R < 20 + PADDLE_W && b.x + BALL_R > 20
+            && b.y + BALL_R > py0 && b.y - BALL_R < py0 + PADDLE_H
+            && b.vx < 0) {
+          b.vx = Math.abs(b.vx);
+          b.x = 20 + PADDLE_W + BALL_R;
+        }
+
+        const px1 = W - 20 - PADDLE_W;
+        const py1 = state.paddles[1].y - PADDLE_H/2;
+        if (b.x + BALL_R > px1 && b.x - BALL_R < px1 + PADDLE_W
+            && b.y + BALL_R > py1 && b.y - BALL_R < py1 + PADDLE_H
+            && b.vx > 0) {
+          b.vx = -Math.abs(b.vx);
+          b.x = px1 - BALL_R;
+        }
+
+        if (b.x + BALL_R < 0) {
+          state.scores[1]++;
+          b.x = W/2; b.y = H/2; b.vx = -5; b.vy = 3;
+        } else if (b.x - BALL_R > W) {
+          state.scores[0]++;
+          b.x = W/2; b.y = H/2; b.vx = 5; b.vy = -3;
+        }
+      }, TICK_MS);
+
+      setInterval(() => {
+        if (connected) sendState(state);
+      }, 1000 / STATE_HZ);
+    }
+
+    else if (role === 'client') {
+      onState(data => {
+        hasState = true;
+        const ownY = state.paddles[1].y;
+        state.ball = data.ball;
+        state.paddles[0].y = data.paddles[0].y;
+        state.paddles[1].y = ownY;
+        state.scores = data.scores;
+      });
+
+      setInterval(() => {
+        if (keys.ArrowUp) state.paddles[1].y -= PADDLE_SPEED;
+        if (keys.ArrowDown) state.paddles[1].y += PADDLE_SPEED;
+        state.paddles[1].y = clampPaddle(state.paddles[1].y);
+        if (connected) sendInput({ y: state.paddles[1].y });
+      }, TICK_MS);
+    }
+
+    (function loop() {
+      draw(state);
+      if (!connected) {
+        ctx.fillStyle = 'rgba(0,0,0,0.72)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#fff';
+        ctx.font = '24px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('Waiting for opponent…', W/2, H/2);
+        ctx.fillStyle = '#aaa';
+        ctx.font = '14px monospace';
+        ctx.fillText(`room ${roomCode}`, W/2, H/2 + 34);
+      }
+      requestAnimationFrame(loop);
+    })();
   </script>
 </body>
 </html>
